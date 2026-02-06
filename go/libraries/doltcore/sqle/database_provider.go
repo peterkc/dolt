@@ -419,8 +419,15 @@ func (p *DoltDatabaseProvider) HasDatabase(ctx *sql.Context, name string) bool {
 
 func (p *DoltDatabaseProvider) AllDatabases(ctx *sql.Context) (all []sql.Database) {
 	p.mu.RLock()
-	showBranches, _ := dsess.GetBooleanSystemVar(ctx, dsess.ShowBranchDatabases)
-	currentDBName, _, err := dsess.ResolveRevisionDelimiter(ctx, ctx.GetCurrentDatabase())
+	showBranches, err := dsess.GetBooleanSystemVar(ctx, dsess.ShowBranchDatabases)
+	if err != nil {
+		ctx.GetLogger().Warn(err)
+	}
+	enableRevisionDelimiterAlias, err := dsess.GetBooleanSystemVar(ctx, dsess.DoltEnableRevisionDelimiterAlias)
+	if err != nil {
+		ctx.GetLogger().Warn(err)
+	}
+	currentDBName, usesRevisionDelimiterAlias, err := dsess.ResolveRevisionDelimiter(ctx, ctx.GetCurrentDatabase())
 	if err != nil {
 		ctx.GetLogger().Warn(err)
 	}
@@ -429,6 +436,10 @@ func (p *DoltDatabaseProvider) AllDatabases(ctx *sql.Context) (all []sql.Databas
 
 	all = make([]sql.Database, 0, len(p.databases))
 	for _, db := range p.databases {
+		if enableRevisionDelimiterAlias && usesRevisionDelimiterAlias && db.Name() == ctx.GetCurrentDatabase() {
+			continue
+		}
+
 		all = append(all, db)
 
 		if showBranches && db.Name() != clusterdb.DoltClusterDbName {
@@ -488,17 +499,28 @@ func (p *DoltDatabaseProvider) allRevisionDbs(ctx *sql.Context, db dsess.SqlData
 		return nil, err
 	}
 
-	revDbs := make([]sql.Database, len(branches))
-	for i, branch := range branches {
+	revDbs := make([]sql.Database, 0, len(branches))
+	dbName, _, err := dsess.ResolveRevisionDelimiter(ctx, ctx.GetCurrentDatabase())
+	if err != nil {
+		return nil, err
+	}
+	for _, branch := range branches {
 		revisionQualifiedName := fmt.Sprintf("%s/%s", db.Name(), branch.GetPath())
-		revDb, ok, err := p.databaseForRevision(ctx, revisionQualifiedName, db.Name())
+		var revDb dsess.SqlDatabase
+		var ok bool
+		// If the current DB matches, it means we're either using `@` or `/` delimited revision database name. So, we
+		// replace the revisionQualifiedName with the [ctx.GetCurrentDatabase] result to maintain the exact delimiter.
+		if revisionQualifiedName == dbName {
+			revisionQualifiedName = ctx.GetCurrentDatabase()
+		}
+		revDb, ok, err = p.databaseForRevision(ctx, revisionQualifiedName, revisionQualifiedName)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return nil, fmt.Errorf("cannot get revision database for %s/%s", db.Name(), branch.GetPath())
 		}
-		revDbs[i] = revDb
+		revDbs = append(revDbs, revDb)
 	}
 
 	return revDbs, nil
@@ -1419,7 +1441,6 @@ func resolveAncestorSpec(ctx *sql.Context, revSpec string, ddb *doltdb.DoltDB) (
 // BaseDatabase returns the base database for the specified database name. Meant for informational purposes when
 // managing the session initialization only. Use SessionDatabase for normal database retrieval.
 func (p *DoltDatabaseProvider) BaseDatabase(ctx *sql.Context, name string) (dsess.SqlDatabase, bool) {
-	name, _, _ = dsess.ResolveRevisionDelimiter(ctx, name)
 	baseName := name
 	isRevisionDbName := strings.Contains(name, doltdb.DbRevisionDelimiter)
 
